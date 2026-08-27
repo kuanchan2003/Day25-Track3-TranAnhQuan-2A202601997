@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import random
+from copy import deepcopy
 from pathlib import Path
 
 from reliability_lab.cache import ResponseCache, SharedRedisCache
@@ -51,7 +52,7 @@ def build_gateway(config: LabConfig, provider_overrides: dict[str, float] | None
 def calculate_recovery_time_ms(gateway: ReliabilityGateway) -> float | None:
     """Derive recovery time from circuit breaker transition logs.
 
-    TODO(student): Implement recovery time calculation:
+    Recovery time calculation:
     1. For each breaker in gateway.breakers.values():
        - Walk breaker.transition_log entries
        - Track when circuit goes to "open" (save ts)
@@ -62,13 +63,25 @@ def calculate_recovery_time_ms(gateway: ReliabilityGateway) -> float | None:
     Each transition_log entry is a dict with keys: "from", "to", "reason", "ts"
     where "ts" is time.time() (epoch seconds).
     """
-    raise NotImplementedError("TODO: implement calculate_recovery_time_ms()")
+    recovery_times: list[float] = []
+    for breaker in gateway.breakers.values():
+        opened_at: float | None = None
+        for transition in breaker.transition_log:
+            if transition["to"] == "open":
+                opened_at = float(transition["ts"])
+            elif transition["to"] == "closed" and opened_at is not None:
+                recovery_times.append((float(transition["ts"]) - opened_at) * 1000)
+                opened_at = None
+
+    if not recovery_times:
+        return None
+    return sum(recovery_times) / len(recovery_times)
 
 
 def run_scenario(config: LabConfig, queries: list[str], scenario: ScenarioConfig) -> RunMetrics:
     """Run a single named chaos scenario.
 
-    TODO(student): Implement the scenario runner:
+    Scenario runner:
     1. Build gateway with build_gateway(config, scenario.provider_overrides or None)
     2. Create empty RunMetrics()
     3. Loop config.load_test.requests times:
@@ -86,14 +99,49 @@ def run_scenario(config: LabConfig, queries: list[str], scenario: ScenarioConfig
     5. Set recovery_time_ms via calculate_recovery_time_ms(gateway)
     6. Return metrics
     """
-    raise NotImplementedError("TODO: implement run_scenario()")
+    if not queries:
+        raise ValueError("At least one query is required to run a scenario")
+
+    gateway = build_gateway(config, scenario.provider_overrides or None)
+    metrics = RunMetrics()
+    try:
+        for _ in range(config.load_test.requests):
+            result = gateway.complete(random.choice(queries))
+            metrics.total_requests += 1
+            metrics.estimated_cost += result.estimated_cost
+
+            if result.cache_hit:
+                metrics.cache_hits += 1
+                metrics.estimated_cost_saved += 0.001
+
+            if result.route == "fallback":
+                metrics.fallback_successes += 1
+                metrics.successful_requests += 1
+            elif result.route == "static_fallback":
+                metrics.static_fallbacks += 1
+                metrics.failed_requests += 1
+            else:
+                metrics.successful_requests += 1
+
+            if result.latency_ms > 0:
+                metrics.latencies_ms.append(result.latency_ms)
+
+        metrics.circuit_open_count = sum(
+            transition["to"] == "open"
+            for breaker in gateway.breakers.values()
+            for transition in breaker.transition_log
+        )
+        metrics.recovery_time_ms = calculate_recovery_time_ms(gateway)
+        return metrics
+    finally:
+        if isinstance(gateway.cache, SharedRedisCache):
+            gateway.cache.close()
 
 
 def run_simulation(config: LabConfig, queries: list[str]) -> RunMetrics:
     """Run all named scenarios from config, or a default run if none defined.
 
-    TODO(student): Add a cache vs no-cache comparison scenario.
-    Extend with your own custom scenarios (e.g., cost cap near limit).
+    Includes a healthy-provider cache comparison after the configured scenarios.
     """
     if not config.scenarios:
         default_scenario = ScenarioConfig(name="default", description="baseline run")
@@ -102,13 +150,21 @@ def run_simulation(config: LabConfig, queries: list[str]) -> RunMetrics:
         return metrics
 
     combined = RunMetrics()
+    healthy_result: RunMetrics | None = None
     for scenario in config.scenarios:
         result = run_scenario(config, queries, scenario)
 
-        # TODO(student): Define pass/fail criteria per scenario.
-        # Example: primary_timeout_100 passes if fallback_success_rate > 0.9
-        passed = result.successful_requests > 0
+        if scenario.name == "primary_timeout_100":
+            passed = result.fallback_success_rate >= 0.9 and result.circuit_open_count >= 1
+        elif scenario.name == "all_providers_down":
+            passed = result.static_fallbacks == result.total_requests
+        elif scenario.name == "all_healthy":
+            passed = result.availability >= 0.99 and result.circuit_open_count == 0
+            healthy_result = result
+        else:
+            passed = result.availability > 0
         combined.scenarios[scenario.name] = "pass" if passed else "fail"
+        combined.scenario_details[scenario.name] = result.to_report_dict()
 
         combined.total_requests += result.total_requests
         combined.successful_requests += result.successful_requests
@@ -125,5 +181,20 @@ def run_simulation(config: LabConfig, queries: list[str]) -> RunMetrics:
                 combined.recovery_time_ms = result.recovery_time_ms
             else:
                 combined.recovery_time_ms = (combined.recovery_time_ms + result.recovery_time_ms) / 2
+
+    comparison_scenario = ScenarioConfig(
+        name="cache_comparison",
+        description="Healthy providers with response cache disabled",
+        provider_overrides={provider.name: 0.0 for provider in config.providers},
+    )
+    without_cache_config = deepcopy(config)
+    without_cache_config.cache.enabled = False
+    without_cache = run_scenario(without_cache_config, queries, comparison_scenario)
+    if healthy_result is None:
+        healthy_result = run_scenario(config, queries, comparison_scenario)
+    combined.cache_comparison = {
+        "without_cache": without_cache.to_report_dict(),
+        "with_cache": healthy_result.to_report_dict(),
+    }
 
     return combined

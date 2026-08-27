@@ -1,19 +1,19 @@
 .PHONY: test lint typecheck run-chaos report clean docker-up docker-down
 
 test:
-	pytest -q
+	uv run --extra dev pytest -q
 
 lint:
-	ruff check src tests scripts
+	uv run --extra dev ruff check src tests scripts
 
 typecheck:
-	mypy src
+	uv run --extra dev mypy src
 
 run-chaos:
-	python scripts/run_chaos.py --config configs/default.yaml --out reports/metrics.json
+	uv run python scripts/run_chaos.py --config configs/default.yaml --out reports/metrics.json
 
 report:
-	python scripts/generate_report.py --metrics reports/metrics.json --out reports/final_report.md
+	uv run python scripts/generate_report.py --metrics reports/metrics.json --out reports/final_report.md
 
 docker-up:
 	docker compose up -d
